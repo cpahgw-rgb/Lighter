@@ -1,9 +1,9 @@
-# volume_bot.py
+# volume_bot.py (Lighter Volume Bot - 최종 수정 버전)
 # Python 3.11 호환, asyncio + tkinter GUI
-# - TEST_MODE True: 모의거래 (안전)
-# - TEST_MODE False: Lighter SDK 사용 (실거래)
-#
-# 꼭: 실제로 실거래 실행 전에는 TEST_MODE=True로 충분히 테스트하세요.
+# - LIGHTER SDK 동기 호출을 asyncio.to_thread로 비동기 환경에 통합
+# - 주문 실패 방지 위해 TimeInForce=IOC 설정
+# - GUI 잔액 업데이트 로직 추가
+# - 모든 들여쓰기(Indentation) 정리 완료
 
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
@@ -11,25 +11,33 @@ import threading
 import asyncio
 import time
 import random
-import json
-import os
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime
 from typing import Optional
+import os 
+import aiohttp
+# lighter SDK import (실행 시 필요)
+try:
+    import lighter
+except ImportError:
+    print("경고: 'lighter' 라이브러리가 설치되지 않았습니다. pip install lighter 로 설치해주세요.")
+    lighter = None
+
 
 # ------------------ 사용자 설정 (여기만 수정) ------------------
-LIGHTER_API_KEY = "여기에 본인키 입력"         # 실제 운영시 여기에 키 넣기 (문자열)
-LIGHTER_ACCOUNT_INDEX = 0
+# 💡 보안 권고: 실제 운영시 환경 변수 사용을 권장합니다.
+LIGHTER_API_KEY = "본인키입력"          # 실제 운영시 여기에 키 넣기 (문자열)
+LIGHTER_ACCOUNT_INDEX = 1                 # 🚨 이전 로그에서 확인된 유효한 인덱스 사용
 LIGHTER_API_KEY_INDEX = 0
 
-TEST_MODE = False             # True: Mock(권장 테스트). False: 실거래 (주의!)
-MIN_ORDER_SIZE = Decimal("0.005")   # 최소 주문 수량 (ETH)
-SLIPPAGE_PCT = Decimal("0.01")      # 1% 기본 슬리피지
-BALANCE_POLL_EVERY = 3       # 잔고 조회는 트레이드 루프에서 N회마다 1회 (호가보다 적게)
-API_COOLDOWN = 1.5           # 루프 기본 쿨다운(초)
-MAX_RETRIES = 3              # 에러 복구 재시도 횟수
+TEST_MODE = False                     # True: Mock(권장 테스트). False: 실거래 (주의!)
+MIN_ORDER_SIZE = Decimal("0.005")     # 최소 주문 수량 (ETH)
+SLIPPAGE_PCT = Decimal("0.01")        # 1% 기본 슬리피지 (IOC 주문 시 즉시 체결 유도)
+BALANCE_POLL_EVERY = 3                # 잔고 조회는 트레이드 루프에서 N회마다 1회
+API_COOLDOWN = 1.5                    # 루프 기본 쿨다운(초)
+MAX_RETRIES = 3                       # 에러 복구 재시도 횟수
 LOG_FILE = "volume_bot.log"
-MARKET_INDEX = 2048          # 코드에서 사용한 마켓 인덱스 (필요시 변경)
+MARKET_INDEX = 2048                   # ETH/USDC 마켓 (필요시 변경)
 # ----------------------------------------------------------------
 
 # 안전 타입 래퍼
@@ -41,7 +49,6 @@ class Logger:
     def __init__(self, gui_callback=None, path=LOG_FILE):
         self.gui_callback = gui_callback
         self.path = path
-        # create file if not exist
         try:
             open(self.path, "a").close()
         except Exception:
@@ -52,20 +59,18 @@ class Logger:
 
     def log(self, msg):
         line = f"[{self._ts()}] {msg}"
-        # gui
         if self.gui_callback:
             try:
+                # GUI 업데이트는 메인 스레드에서 실행
                 self.gui_callback('log', line)
             except Exception:
                 pass
-        # file
+        print(line)
         try:
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
             pass
-        # also print to stdout for debug
-        print(line)
 
 # ------------------ Lighter client wrapper ------------------
 class LighterClient:
@@ -77,13 +82,13 @@ class LighterClient:
         self.order_counter = 0
 
     async def init(self):
-        # create aiohttp session for potential REST calls (kept for future)
-        import aiohttp
+        # aiohttp session 생성
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
-        # try to import signer only if API key present and TEST_MODE disabled
-        if LIGHTER_API_KEY and not TEST_MODE:
+        
+        # signer 초기화 시도
+        if LIGHTER_API_KEY and not TEST_MODE and lighter:
             try:
-                import lighter
+                # SignerClient는 동기 객체입니다.
                 self.signer = lighter.SignerClient(
                     url="https://mainnet.zklighter.elliot.ai",
                     account_index=LIGHTER_ACCOUNT_INDEX,
@@ -94,10 +99,10 @@ class LighterClient:
                 self.logger.log(f"[ERROR] Lighter SDK 연결 실패: {e}")
                 self.signer = None
         else:
-            self.logger.log("[INFO] LighterClient: TEST_MODE or no API key - signer 미사용")
+            self.logger.log("[INFO] LighterClient: TEST_MODE 또는 API 키 없음 - signer 미사용")
 
     async def close(self):
-        if self.session:
+        if self.session and not self.session.closed:
             await self.session.close()
 
     def _next_order_id(self):
@@ -105,23 +110,24 @@ class LighterClient:
         return int(time.time() * 1000) % (2**31) + self.order_counter
 
     async def create_order(self, is_ask: bool, base_amount: int, price_int: int):
-        # Wrap signer.create_order with safe coroutine handling
         if not self.signer:
             return {'error': 'No signer'}
+        
         try:
-            res = self.signer.create_order(
+            # 💡 핵심 수정: 동기 함수인 self.signer.create_order를 asyncio.to_thread로 래핑하여 논블로킹으로 실행
+            res = await asyncio.to_thread(
+                self.signer.create_order,
                 market_index=MARKET_INDEX,
                 client_order_index=self._next_order_id(),
                 base_amount=base_amount,
                 price=price_int,
                 is_ask=is_ask,
-                order_type=0,
-                time_in_force=0,
+                order_type=0,           
+                time_in_force=1,        # 💡 IOC (Immediate-Or-Cancel)로 설정하여 미체결 방지
                 reduce_only=False,
                 order_expiry=0,
             )
-            if asyncio.iscoroutine(res):
-                res = await res
+            # res는 이미 동기 함수 실행 결과
             return {'response': res}
         except Exception as e:
             return {'error': str(e)}
@@ -129,7 +135,6 @@ class LighterClient:
 # ------------------ Volume Bot (실거래/모의 공통 로직) ------------------
 class VolumeBot:
     def __init__(self, callback):
-        # callback(event, data)
         self.callback = callback
         self.logger = Logger(gui_callback=callback)
         self.client: Optional[LighterClient] = None
@@ -152,6 +157,8 @@ class VolumeBot:
         self.total_volume = D("0")
         self.is_buy_turn = True
         self.current_amount = D("0")
+        self.eth_balance = D("0")
+        self.usdc_balance = D("0")
 
         # control
         self._balance_poll_counter = 0
@@ -182,29 +189,27 @@ class VolumeBot:
 
     # ------------------ Mock / real API helpers ------------------
     async def _mock_get_price(self):
-        # return bid, ask as Decimal
         mid = D("2000") + D(str(random.uniform(-5, 5)))
         return (mid - D("0.5"), mid + D("0.5"))
 
     async def _mock_get_balance(self):
-        return (D("0.1"), D("200.0"))  # eth, usdc
+        self.eth_balance = D("0.1")
+        self.usdc_balance = D("200.0")
+        return (self.eth_balance, self.usdc_balance)
 
     # price & balance getters (with error handling and backoff)
     async def get_price(self):
-        # respect backoff if set
         if self._backoff_seconds > 0:
-            self.log(f"[BACKOFF] 대기 중: {self._backoff_seconds:.0f}초")
+            self.log(f"[BACKOFF] 가격 조회 대기 중: {self._backoff_seconds:.0f}초")
             await asyncio.sleep(self._backoff_seconds)
             self._backoff_seconds = 0
 
         if TEST_MODE:
             return await self._mock_get_price()
 
-        # 실거래: call REST endpoint (async) or use signer if available
-        # We will use client.session to call GET /orderBookOrders
         try:
             async with self.client.session.get(f"{self.client.base_url}/orderBookOrders",
-                                               params={'market_id': str(MARKET_INDEX), 'limit': '1'}) as resp:
+                                                params={'market_id': str(MARKET_INDEX), 'limit': '1'}) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     bids = data.get('bids', [])
@@ -217,9 +222,8 @@ class VolumeBot:
                         best_ask = D(str(asks[0].get('price', '0')))
                     return best_bid, best_ask
                 elif resp.status == 429:
-                    self.logger.log("[ERROR] HTTP 429 /orderBookOrders")
-                    # set backoff
-                    self._backoff_seconds = min(30, (self._backoff_seconds or 1) * 2)
+                    self.logger.log("[ERROR] HTTP 429 /orderBookOrders - 백오프 적용")
+                    self._backoff_seconds = min(30, (self._backoff_seconds or API_COOLDOWN) * 2)
                     return D("0"), D("0")
                 else:
                     self.logger.log(f"[ERROR] HTTP {resp.status} /orderBookOrders")
@@ -231,9 +235,10 @@ class VolumeBot:
     async def get_balance(self):
         if TEST_MODE:
             return await self._mock_get_balance()
+        
         try:
             async with self.client.session.get(f"{self.client.base_url}/account",
-                                               params={'by': 'index', 'value': str(LIGHTER_ACCOUNT_INDEX)}) as resp:
+                                                params={'by': 'index', 'value': str(LIGHTER_ACCOUNT_INDEX)}) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     eth = D("0")
@@ -246,10 +251,20 @@ class VolumeBot:
                                 eth = D(str(asset.get('balance', '0')))
                             elif asset.get('symbol') == 'USDC':
                                 usdc = D(str(asset.get('balance', '0')))
+                    
+                    self.eth_balance = eth
+                    self.usdc_balance = usdc
+
+                    # 💡 GUI 잔액 업데이트 (수정 사항)
+                    try:
+                        self.callback('balance', {'eth': float(eth), 'usdc': float(usdc)})
+                    except Exception as e:
+                        self.logger.log(f"[ERROR] GUI 잔액 업데이트 실패: {e}")
+
                     return eth, usdc
                 elif resp.status == 429:
-                    self.logger.log("[ERROR] HTTP 429 /account")
-                    self._backoff_seconds = min(30, (self._backoff_seconds or 1) * 2)
+                    self.logger.log("[ERROR] HTTP 429 /account - 백오프 적용")
+                    self._backoff_seconds = min(30, (self._backoff_seconds or API_COOLDOWN) * 2)
                     return D("0"), D("0")
                 else:
                     self.logger.log(f"[ERROR] HTTP {resp.status} /account")
@@ -258,16 +273,22 @@ class VolumeBot:
             self.logger.log(f"[ERROR] 잔고 조회 예외: {e}")
             return D("0"), D("0")
 
+
     # order send wrapper with retries and fill parsing
     async def _send_order(self, is_sell: bool, amount: Decimal, price_ref: Decimal):
-        # converts amount to base amount unit used by API (example: 1 ETH => base 10^4)
         try:
+            # Lighter의 Atomic Unit 변환 (ETH: 10^4, Price: 100)
             base_amount = int((amount * D(10**4)).to_integral_value(rounding=ROUND_DOWN))
             tick = D("0.01")
+            
+            # 슬리피지 적용하여 즉시 체결 유도
             if is_sell:
+                # 매도: 낮은 가격에 주문 (최고 매수호가 - 슬리피지)
                 price_with_slippage = price_ref - max(price_ref * self.slippage_pct, tick)
             else:
+                # 매수: 높은 가격에 주문 (최저 매도호가 + 슬리피지)
                 price_with_slippage = price_ref + max(price_ref * self.slippage_pct, tick)
+            
             price_int = int((price_with_slippage * D(100)).to_integral_value(rounding=ROUND_DOWN))
         except Exception as e:
             return {'error': f'Order parameter conversion error: {e}'}
@@ -280,30 +301,31 @@ class VolumeBot:
 
         # real send with retries
         attempt = 0
-        backoff = 1
+        backoff = 1.0
         while attempt < MAX_RETRIES:
             attempt += 1
             resp = await self.client.create_order(is_ask=is_sell, base_amount=base_amount, price_int=price_int)
+            
             if 'error' in resp:
                 err = resp['error']
-                # if rate-limited, expand backoff
                 if '429' in str(err) or 'Too Many Requests' in str(err):
-                    self.logger.log("[ERROR] 주문 429 응답, 백오프 적용")
+                    self.logger.log(f"[ERROR] 주문 429 응답, 백오프 적용: {backoff:.1f}초")
                     await asyncio.sleep(backoff)
-                    backoff = min(10, backoff * 2)
+                    backoff = min(10.0, backoff * 2)
                     continue
                 else:
-                    # other error: retry short
                     self.logger.log(f"[ERROR] 주문 오류: {err} (retry {attempt}/{MAX_RETRIES})")
                     await asyncio.sleep(backoff)
-                    backoff = min(5, backoff * 2)
+                    backoff = min(5.0, backoff * 2)
                     continue
-            # parse response
+            
+            # --- 주문 성공 및 체결 결과 파싱 ---
             r = resp.get('response', {})
-            # defensive parsing for fills
             filled_amount = D("0")
             avg_price = D("0")
+
             try:
+                # 1. 'fills' 리스트 파싱 시도 (가장 정확한 정보)
                 fills = r.get('fills') or r.get('filled') or []
                 if isinstance(fills, list) and fills:
                     total_base = D("0")
@@ -316,20 +338,26 @@ class VolumeBot:
                     if total_base > 0:
                         filled_amount = total_base
                         avg_price = (total_quote / total_base).quantize(D('0.0001'))
-                else:
+                
+                # 2. 개별 필드 파싱 시도 (Fallback)
+                if filled_amount == 0:
                     fa = r.get('filled_base_amount') or r.get('filledAmount') or r.get('filled_amount')
                     ap = r.get('avg_price') or r.get('avgPrice') or r.get('avg')
                     if fa:
                         filled_amount = D(str(fa))
                     if ap:
                         avg_price = D(str(ap))
-            except Exception:
-                # best-effort parsing fallback
-                pass
 
-            # If no fills in response, treat as partial/unknown -> return response for further handling
+            except Exception as e:
+                self.logger.log(f"[WARN] 체결 정보 파싱 중 예외 발생: {e}")
+                pass # 최선을 다해 파싱 후 진행
+
+            # IOC 주문(time_in_force=1)의 경우, 체결이 안 되면 서버가 응답에서 0으로 반환할 수 있음.
+            # 하지만 봇은 볼륨 생성이 목적이므로, 체결이 0이라면 주문이 취소된 것으로 간주하고 실패 처리함.
             if filled_amount == 0:
-                return {'error': 'No fill info', 'response': r}
+                # 💡 IOC 주문인데 fill이 0이면, 잔고 부족이나 호가 차이로 인해 즉시 취소된 것입니다.
+                return {'error': 'Order cancelled (0 fill from IOC)', 'response': r}
+
             return {'success': True, 'filled_amount': filled_amount, 'avg_price': avg_price, 'response': r}
 
         return {'error': 'Max retries exceeded'}
@@ -345,33 +373,44 @@ class VolumeBot:
         if self.is_buy_turn:
             self.current_amount = self._rand_amount()
             amount = self.current_amount
+            # 매수 시 USDC 잔고 확인 로직 추가 필요 (현재는 ETH 잔고만 확인)
+            if amount * best_ask > self.usdc_balance:
+                 self.log(f"[ERROR] USDC 잔고 부족: {self.usdc_balance:.2f} USDC")
+                 # 잔고 부족 시 다음 턴을 스킵하고 다시 잔고 체크 및 반대매매 유도
+                 return False
+
             if amount < self.min_order_size:
                 self.log(f"[ERROR] 주문 수량이 최소값 미만: {amount}")
                 return False
-            self.log(f"[BUY] 시도 {amount} ETH @ 호가 {best_ask}")
+            
+            self.log(f"[BUY] 시도 {amount} ETH @ 호가 {best_ask} (슬리피지 적용)")
             res = await self._send_order(False, amount, best_ask)
+            
             if res.get('success'):
                 filled = res.get('filled_amount', D('0'))
                 avg_price = res.get('avg_price', D('0'))
                 self.total_volume += (filled * avg_price)
-                self.log(f"[SUCCESS] 매수 체결: {filled} ETH @ {avg_price}")
+                self.log(f"[SUCCESS] 매수 체결: {filled} ETH @ {avg_price:.4f}")
             else:
                 self.log(f"[ERROR] 매수 실패: {res.get('error')}")
                 return False
         else:
             # sell: check balance
-            eth, usdc = await self.get_balance()
-            amount = min(self.current_amount, eth).quantize(D('0.0001'), ROUND_DOWN)
+            # 매도 시에는 ETH 잔고 확인
+            amount = min(self.current_amount, self.eth_balance).quantize(D('0.0001'), ROUND_DOWN)
             if amount < self.min_order_size:
-                self.log(f"[ERROR] ETH 잔고 부족: {eth}")
+                self.log(f"[ERROR] ETH 잔고 부족: {self.eth_balance:.4f} ETH")
+                # 잔고 부족 시 다음 턴을 스킵하고 다시 잔고 체크 및 반대매매 유도
                 return False
-            self.log(f"[SELL] 시도 {amount} ETH @ 호가 {best_bid}")
+                
+            self.log(f"[SELL] 시도 {amount} ETH @ 호가 {best_bid} (슬리피지 적용)")
             res = await self._send_order(True, amount, best_bid)
+            
             if res.get('success'):
                 filled = res.get('filled_amount', D('0'))
                 avg_price = res.get('avg_price', D('0'))
                 self.total_volume += (filled * avg_price)
-                self.log(f"[SUCCESS] 매도 체결: {filled} ETH @ {avg_price}")
+                self.log(f"[SUCCESS] 매도 체결: {filled} ETH @ {avg_price:.4f}")
             else:
                 self.log(f"[ERROR] 매도 실패: {res.get('error')}")
                 return False
@@ -380,6 +419,7 @@ class VolumeBot:
         self.is_buy_turn = not self.is_buy_turn
         self.trade_count += 1
         self.session_trades += 1
+        
         # emit stats
         try:
             self.callback('stats', {'count': self.trade_count, 'volume': float(self.total_volume)})
@@ -390,32 +430,36 @@ class VolumeBot:
     # ------------------ main loop ------------------
     async def _run(self):
         await self.init()
-        await self.get_balance()  # initial read
+        # 초기 잔고 조회
+        eth_start, usdc_start = await self.get_balance()
+        if eth_start == 0 and usdc_start == 0 and not TEST_MODE:
+            self.log("[CRITICAL] 잔고가 0입니다. 트레이딩을 중단합니다.")
+            self.running = False
+            await self.close()
+            return
+
         while self.running:
+            # 휴식 체크
             if self.session_trades >= self.trades_before_rest:
                 rest_time = self._rand_rest()
                 rest_min = rest_time / 60
                 self.log(f"[REST] 휴식 시작: {rest_min:.0f}분")
-                # countdown (non-blocking GUI update)
                 await asyncio.sleep(rest_time)
                 self.session_trades = 0
                 self.log("[REST] 휴식 끝, 재개")
 
-            # balance polling strategy: poll every N cycles to reduce calls
+            # 잔고 폴링
             if self._balance_poll_counter % BALANCE_POLL_EVERY == 0:
                 await self.get_balance()
             self._balance_poll_counter += 1
 
-            # execute trade with per-loop cooldowns and backoffs
+            # 트레이드 실행
             success = await self.execute_trade()
 
-            # Always apply a base cooldown to prevent tight loop (even on failures)
-            # backoff_seconds set earlier applies at next get_price() call if 429 seen
+            # 쿨다운 적용
             wait_for = API_COOLDOWN
             if not success:
-                # failed trade -> slightly longer cooldown
                 wait_for = max(wait_for, 2.0)
-            # Also add random jitter to avoid deterministic patterns
             wait_for += random.uniform(0, 0.5)
             self.log(f"[WAIT] 다음 루프까지 {wait_for:.1f}초")
             await asyncio.sleep(wait_for)
@@ -432,6 +476,14 @@ class VolumeBot:
             return
         self.running = True
         # run loop on separate thread with asyncio
+        # Windows에서 asyncio를 위해 정책 설정 (필요한 경우)
+        if os.name == 'nt':
+            try:
+                policy = asyncio.WindowsSelectorEventLoopPolicy()
+                asyncio.set_event_loop_policy(policy)
+            except AttributeError:
+                pass
+
         threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True).start()
 
     def stop(self):
@@ -441,10 +493,12 @@ class VolumeBot:
 class VolumeGUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Lighter Volume Bot v2 (Stable)")
+        self.root.title(f"Lighter Volume Bot v2 ({'TEST' if TEST_MODE else 'LIVE'})")
         self.root.geometry("760x620")
         self.bot: Optional[VolumeBot] = None
-
+        self.create_widgets()
+        
+    def create_widgets(self):
         # Status / balances / stats
         top = tk.Frame(self.root)
         top.pack(fill=tk.X, padx=8, pady=6)
@@ -462,11 +516,11 @@ class VolumeGUI:
         ctrl.pack(fill=tk.X, padx=8, pady=6)
 
         tk.Label(ctrl, text="수량 최소").grid(row=0, column=0, padx=6, pady=6)
-        self.entry_min_amount = tk.Entry(ctrl, width=10); self.entry_min_amount.insert(0, "0.005")
+        self.entry_min_amount = tk.Entry(ctrl, width=10); self.entry_min_amount.insert(0, str(float(D("0.005"))))
         self.entry_min_amount.grid(row=0, column=1, padx=6, pady=6)
 
         tk.Label(ctrl, text="수량 최대").grid(row=0, column=2, padx=6, pady=6)
-        self.entry_max_amount = tk.Entry(ctrl, width=10); self.entry_max_amount.insert(0, "0.015")
+        self.entry_max_amount = tk.Entry(ctrl, width=10); self.entry_max_amount.insert(0, str(float(D("0.015"))))
         self.entry_max_amount.grid(row=0, column=3, padx=6, pady=6)
 
         tk.Label(ctrl, text="슬리피지 (%)").grid(row=1, column=0, padx=6, pady=6)
@@ -505,15 +559,17 @@ class VolumeGUI:
         self.btn_stop = tk.Button(btn_frame, text="■ 중단", bg="#f44336", fg="white", command=self.stop_bot, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=6)
         self.btn_clear = tk.Button(btn_frame, text="로그 지우기", command=self.clear_log); self.btn_clear.pack(side=tk.RIGHT, padx=6)
-
+        
         # Log
         log_frame = tk.LabelFrame(self.root, text="로그")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
         self.log_text = scrolledtext.ScrolledText(log_frame, height=18)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
+
     # GUI callback
     def callback(self, event, data):
+        # tkinter는 스레드 안전하지 않으므로, root.after를 사용
         if event == 'log':
             self.root.after(0, lambda: self.append_log(data))
         elif event == 'balance':
@@ -542,18 +598,18 @@ class VolumeGUI:
             pass
 
     def update_status(self, text):
-        # not used heavily
-        pass
+        pass # 현재는 사용되지 않음
 
     # start/stop
     def start_bot(self):
-        # validate and apply settings
         try:
             if self.btn_start['state'] == tk.DISABLED:
                 return
+            
             # instantiate bot
             self.bot = VolumeBot(self.callback)
-            # apply GUI settings
+            
+            # apply GUI settings (Decimal 변환 시도)
             self.bot.min_amount = D(self.entry_min_amount.get())
             self.bot.max_amount = D(self.entry_max_amount.get())
             self.bot.slippage_pct = D(self.entry_slippage.get()) / D(100)
@@ -564,13 +620,17 @@ class VolumeGUI:
             self.bot.rest_min = float(self.entry_rest_min.get())
             self.bot.rest_max = float(self.entry_rest_max.get())
 
+            # Validation
+            if self.bot.min_amount >= self.bot.max_amount or self.bot.min_interval >= self.bot.max_interval:
+                raise ValueError("최소값은 최대값보다 작아야 합니다.")
+
             # start
             self.bot.start()
             self.btn_start.config(state=tk.DISABLED)
             self.btn_stop.config(state=tk.NORMAL)
-            self.append_log("[INFO] 봇 시작")
+            self.append_log("[INFO] 봇 시작 (설정 적용 완료)")
         except Exception as e:
-            messagebox.showerror("설정 오류", str(e))
+            messagebox.showerror("설정/시작 오류", str(e))
 
     def stop_bot(self):
         if self.bot:
@@ -584,7 +644,8 @@ class VolumeGUI:
 
 # ------------------ 실행 ------------------
 if __name__ == "__main__":
+    if lighter is None and not TEST_MODE:
+        print("\nFATAL: Lighter SDK가 설치되지 않아 실거래 모드(TEST_MODE=False)를 실행할 수 없습니다.\n")
+    
     app = VolumeGUI()
     app.root.mainloop()
-
-
