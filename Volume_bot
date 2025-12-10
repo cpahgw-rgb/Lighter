@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Optional
 
 # ------------------ 사용자 설정 (여기만 수정) ------------------
-LIGHTER_API_KEY = "e3e7feec2780b837df2ff9d238d21c6bfe39ae858eb8e6c9771207a8662392ffb947037da950cad2"         # 실제 운영시 여기에 키 넣기 (문자열)
+LIGHTER_API_KEY = "여기에 본인키 입력"         # 실제 운영시 여기에 키 넣기 (문자열)
 LIGHTER_ACCOUNT_INDEX = 0
 LIGHTER_API_KEY_INDEX = 0
 
